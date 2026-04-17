@@ -1,0 +1,4 @@
+# Legacy face_mesh / hands live in mp.solutions (not the newer Tasks-only wheels).
+# Use 0.10.9 if you are on Python 3.12+ or your pip build has no `mediapipe.solutions`.
+opencv-python>=4.8.0
+mediapipe==0.10.9

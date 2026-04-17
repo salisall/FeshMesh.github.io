@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Face Mesh + Hands Mirror</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: #0f1115; color: #e7eaf0; }
+      .app { width: min(960px, 94vw); margin: 1rem auto 2rem; }
+      h1 { margin: 0; font-size: 1.4rem; }
+      .sub { margin: 0.35rem 0 0.8rem; color: #9ba3b4; }
+      .viewer {
+        position: relative;
+        width: 100%;
+        aspect-ratio: 16 / 10;
+        border: 1px solid #232734;
+        border-radius: 12px;
+        overflow: hidden;
+        background: #050608;
+      }
+      #webcam, #overlay {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
+      #webcam { object-fit: cover; transform: scaleX(-1); }
+      #overlay { pointer-events: none; }
+      .hud {
+        margin-top: 0.8rem;
+        border: 1px solid #232734;
+        border-radius: 10px;
+        background: #121621;
+        padding: 0.8rem 0.9rem;
+      }
+      .row { display: flex; flex-wrap: wrap; gap: 0.7rem 1.1rem; align-items: center; }
+      .pill { padding: 0.2rem 0.6rem; border-radius: 999px; border: 1px solid #334; background: #192030; }
+      button {
+        border: 1px solid #34415d;
+        background: #1b2a4c;
+        color: #dce7ff;
+        border-radius: 8px;
+        padding: 0.4rem 0.7rem;
+        cursor: pointer;
+      }
+      button:hover { filter: brightness(1.1); }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <h1>Face Mesh + Hands (Browser)</h1>
+      <p class="sub">Web version of your Python demo: mirrored camera, face mesh, hands, and expression label.</p>
+      <section class="viewer">
+        <video id="webcam" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+      </section>
+      <section class="hud">
+        <div class="row">
+          <span class="pill">Status: <strong id="status">Loading...</strong></span>
+          <span class="pill">Expression: <strong id="expression">-</strong></span>
+          <span class="pill">Confidence: <strong id="confidence">0%</strong></span>
+          <span class="pill">FPS: <strong id="fps">0.0</strong></span>
+          <button id="calibrateBtn">Calibrate neutral</button>
+        </div>
+      </section>
+    </main>
+
+    <script type="module">
+      import {
+        DrawingUtils,
+        FaceLandmarker,
+        FilesetResolver,
+        HandLandmarker,
+      } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+      const video = document.getElementById("webcam");
+      const canvas = document.getElementById("overlay");
+      const statusEl = document.getElementById("status");
+      const exprEl = document.getElementById("expression");
+      const confEl = document.getElementById("confidence");
+      const fpsEl = document.getElementById("fps");
+      const calibrateBtn = document.getElementById("calibrateBtn");
+      const ctx = canvas.getContext("2d");
+      const draw = new DrawingUtils(ctx);
+
+      let faceLandmarker;
+      let handLandmarker;
+      let lastVideoTime = -1;
+      let lastFrameMs = performance.now();
+      let fpsSmooth = 0;
+      let baseline = null;
+      let currentScores = null;
+
+      function setStatus(msg) {
+        statusEl.textContent = msg;
+      }
+
+      function scoreExpression(scores, b = null) {
+        const g = (k) => Math.max(0, scores[k] ?? 0);
+        const smile = Math.max(g("smileLeft"), g("smileRight"));
+        const frown = Math.max(g("frownLeft"), g("frownRight"));
+        const jawOpen = g("jawOpen");
+        const browUp = (g("browOuterUpLeft") + g("browOuterUpRight")) * 0.5;
+        const browDown = (g("browDownLeft") + g("browDownRight")) * 0.5;
+        const noseSneer = Math.max(g("noseSneerLeft"), g("noseSneerRight"));
+
+        const rel = (key, val) => (b ? val - (b[key] ?? 0) : val);
+        const happy = Math.max(0, rel("happy", smile * 1.0 - jawOpen * 0.2));
+        const sad = Math.max(0, rel("sad", frown * 0.9 + browDown * 0.35 - smile * 0.25));
+        const surprised = Math.max(0, rel("surprised", jawOpen * 0.95 + browUp * 0.6));
+        const angry = Math.max(0, rel("angry", browDown * 0.9 + frown * 0.45 - smile * 0.2));
+        const disgust = Math.max(0, rel("disgust", noseSneer * 1.0 + browDown * 0.2));
+        const neutral = Math.max(0, 0.35 - (happy + sad + surprised + angry + disgust) * 0.15);
+
+        const raw = { happy, sad, surprised, angry, disgust, neutral };
+        const top = Object.entries(raw).sort((a, z) => z[1] - a[1])[0];
+        return { label: top[0], confidence: Math.min(1, top[1]), raw };
+      }
+
+      function toScoreMap(blendshapeResult) {
+        if (!blendshapeResult?.length) return null;
+        return Object.fromEntries(blendshapeResult[0].categories.map((c) => [c.categoryName, c.score]));
+      }
+
+      calibrateBtn.addEventListener("click", () => {
+        if (!currentScores) return;
+        const s = scoreExpression(currentScores, null);
+        baseline = { ...s.raw };
+        setStatus("Calibrated (neutral baseline set)");
+      });
+
+      async function initModels() {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm",
+        );
+        faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          },
+          runningMode: "VIDEO",
+          numFaces: 1,
+          outputFaceBlendshapes: true,
+        });
+        handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          },
+          runningMode: "VIDEO",
+          numHands: 2,
+        });
+      }
+
+      async function initCamera() {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await video.play();
+      }
+
+      function resizeCanvas() {
+        const width = video.videoWidth;
+        const height = video.videoHeight;
+        if (!width || !height) return;
+        if (canvas.width !== width || canvas.height !== height) {
+          canvas.width = width;
+          canvas.height = height;
+        }
+      }
+
+      function tick(nowMs) {
+        if (video.currentTime === lastVideoTime) {
+          requestAnimationFrame(tick);
+          return;
+        }
+        const dt = Math.max((nowMs - lastFrameMs) / 1000, 1e-6);
+        lastFrameMs = nowMs;
+        const instFps = 1 / dt;
+        fpsSmooth = fpsSmooth > 0 ? fpsSmooth * 0.92 + instFps * 0.08 : instFps;
+        fpsEl.textContent = fpsSmooth.toFixed(1);
+
+        lastVideoTime = video.currentTime;
+        resizeCanvas();
+
+        const faceRes = faceLandmarker.detectForVideo(video, nowMs);
+        const handRes = handLandmarker.detectForVideo(video, nowMs);
+        currentScores = toScoreMap(faceRes.faceBlendshapes);
+
+        ctx.save();
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.translate(canvas.width, 0);
+        ctx.scale(-1, 1);
+
+        for (const lm of faceRes.faceLandmarks ?? []) {
+          draw.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_TESSELATION, {
+            color: "#00ffc8",
+            lineWidth: 1,
+          });
+          draw.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_CONTOURS, {
+            color: "#9dfae9",
+            lineWidth: 1.2,
+          });
+        }
+        for (const lm of handRes.landmarks ?? []) {
+          draw.drawConnectors(lm, HandLandmarker.HAND_CONNECTIONS, {
+            color: "#ffffff",
+            lineWidth: 2,
+          });
+          draw.drawLandmarks(lm, {
+            color: "#ffa500",
+            lineWidth: 1,
+            radius: 3,
+          });
+        }
+        ctx.restore();
+
+        if (currentScores) {
+          const out = scoreExpression(currentScores, baseline);
+          exprEl.textContent = out.label;
+          confEl.textContent = `${Math.round(out.confidence * 100)}%`;
+          setStatus(baseline ? "Running (calibrated)" : "Running");
+        } else {
+          exprEl.textContent = "-";
+          confEl.textContent = "0%";
+          setStatus("Running (no face detected)");
+        }
+        requestAnimationFrame(tick);
+      }
+
+      async function start() {
+        try {
+          if (!navigator.mediaDevices?.getUserMedia) {
+            throw new Error("Camera API is not available in this browser.");
+          }
+          setStatus("Loading models...");
+          await initModels();
+          setStatus("Starting camera...");
+          await initCamera();
+          setStatus("Running");
+          requestAnimationFrame(tick);
+        } catch (err) {
+          setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      start();
+    </script>
+  </body>
+</html>
